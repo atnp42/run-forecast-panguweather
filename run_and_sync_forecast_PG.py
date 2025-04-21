@@ -40,7 +40,7 @@ def download_folder(dbx, dropbox_path, local_path):
             os.makedirs(lp, exist_ok=True)
             download_folder(dbx, dp, lp)
 
-def is_file_stable(path, min_size_bytes=4_500_000_000, idle_seconds=30):
+def is_file_stable(path, min_size_bytes=3_500_000_000, idle_seconds=30):
     try:
         stat = os.stat(path)
         file_size = stat.st_size
