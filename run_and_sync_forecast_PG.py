@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 ACCESS_TOKEN = os.getenv("DROPBOX_TOKEN")
 dbx = dropbox.Dropbox(ACCESS_TOKEN)
 
-DROPBOX_ASSETS_PATH = "/run_panguweater/assets"
+DROPBOX_ASSETS_PATH = "/run_panguweather/assets"
 LOCAL_ASSETS_PATH = "/workspace/assets"
 
 DROPBOX_RESULTS_PATH = "/panguweather_results"
