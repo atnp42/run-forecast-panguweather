@@ -3,7 +3,10 @@ import time
 import dropbox
 import subprocess
 import threading
+import xarray as xr
+import zipfile
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # === Dropbox Setup ===
 ACCESS_TOKEN = os.getenv("DROPBOX_TOKEN")
@@ -18,10 +21,9 @@ LOCAL_RESULTS_PATH = "/workspace/results"
 os.makedirs(LOCAL_RESULTS_PATH, exist_ok=True)
 os.makedirs(LOCAL_ASSETS_PATH, exist_ok=True)
 
-# === Upload Tracking ===
-uploaded = set()
-pending_uploads = []
-uploads_done = threading.Event()
+# === Bounding Box (CONUS) ===
+lat_min, lat_max = 15, 50
+lon_min, lon_max = -130, -66
 
 # === Hilfsfunktionen ===
 
@@ -40,77 +42,41 @@ def download_folder(dbx, dropbox_path, local_path):
             os.makedirs(lp, exist_ok=True)
             download_folder(dbx, dp, lp)
 
-def is_file_stable(path, min_size_bytes=3_500_000_000, idle_seconds=30):
-    try:
-        stat = os.stat(path)
-        file_size = stat.st_size
-        mtime = stat.st_mtime
-        time_since_mod = time.time() - mtime
-        return file_size >= min_size_bytes and time_since_mod >= idle_seconds
-    except FileNotFoundError:
-        return False
+def subset_and_zip(grib_path, zip_output_path):
+    ds = xr.open_dataset(grib_path, engine="cfgrib")
 
-def upload_result_to_dropbox(local_file):
-    file_name = os.path.basename(local_file)
-    dropbox_target_path = f"{DROPBOX_RESULTS_PATH}/{file_name}"
-    file_size = os.path.getsize(local_file)
-    size_mb = file_size / (1024 * 1024)
+    if ds.longitude.max() > 180:
+        ds = ds.assign_coords(longitude=(ds.longitude + 180) % 360 - 180)
+        ds = ds.sortby("longitude")
 
-    print(f"[UPLOAD] Start: {file_name} ({size_mb:.2f} MB)")
-    CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
+    ds_sub = ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
 
+    temp_dir = Path(grib_path).with_suffix('')
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    nc_files = []
+    for var in ds_sub.data_vars:
+        var_ds = ds_sub[[var]]
+        nc_path = temp_dir / f"{var}.nc"
+        var_ds.to_netcdf(nc_path)
+        nc_files.append(nc_path)
+
+    with zipfile.ZipFile(zip_output_path, 'w') as zipf:
+        for nc_file in nc_files:
+            zipf.write(nc_file, arcname=nc_file.name)
+
+    for nc_file in nc_files:
+        nc_file.unlink()
+    temp_dir.rmdir()
+
+    print(f"[ZIP] Created zip archive: {zip_output_path}")
+
+def upload_file_to_dropbox(local_file, dropbox_path):
+    print(f"[UPLOAD] Uploading {local_file} to {dropbox_path}")
     with open(local_file, "rb") as f:
-        if file_size <= CHUNK_SIZE:
-            print("[UPLOAD] File is small. Uploading in one request.")
-            dbx.files_upload(f.read(), dropbox_target_path, mode=dropbox.files.WriteMode("overwrite"))
-            print("[UPLOAD] Upload complete.")
-        else:
-            total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-            print(f"[UPLOAD] Large file detected. Uploading in {total_chunks} chunks of {CHUNK_SIZE // (1024 * 1024)} MB each.")
-
-            session_start = dbx.files_upload_session_start(f.read(CHUNK_SIZE))
-            cursor = dropbox.files.UploadSessionCursor(session_id=session_start.session_id, offset=f.tell())
-            commit = dropbox.files.CommitInfo(path=dropbox_target_path, mode=dropbox.files.WriteMode("overwrite"))
-
-            chunk_idx = 1
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-
-                if f.tell() < file_size:
-                    dbx.files_upload_session_append_v2(chunk, cursor)
-                    print(f"[UPLOAD] Chunk {chunk_idx}/{total_chunks} appended.")
-                    cursor.offset = f.tell()
-                else:
-                    dbx.files_upload_session_finish(chunk, cursor, commit)
-                    print(f"[UPLOAD] Chunk {chunk_idx}/{total_chunks} uploaded and committed.")
-                    break
-
-                chunk_idx += 1
-
+        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
+    print(f"[UPLOAD] Upload complete: {dropbox_path}")
     os.remove(local_file)
-    print(f"[UPLOAD] File upload complete and local file deleted: {file_name}\n")
-
-def upload_worker():
-    print("[UPLOAD] Background uploader started.")
-    while not uploads_done.is_set() or pending_uploads:
-        for fname in list(pending_uploads):
-            local_path = os.path.join(LOCAL_RESULTS_PATH, fname)
-
-            if fname in uploaded or not os.path.isfile(local_path):
-                continue
-
-            if is_file_stable(local_path):
-                try:
-                    upload_result_to_dropbox(local_path)
-                    uploaded.add(fname)
-                    pending_uploads.remove(fname)
-                except Exception as e:
-                    print(f"[UPLOAD] Error uploading {fname}: {e}")
-        time.sleep(5)
-
-    print("[UPLOAD] All uploads completed. Uploader thread exiting.")
 
 # === Forecast-Loop ===
 
@@ -120,6 +86,8 @@ def run_forecasts():
     lead_time = 168
     time_str = "1200"
     model = "panguweather"
+
+    forecast_count = 0
 
     while start_date <= end_date:
         date_str = start_date.strftime("%Y%m%d")
@@ -139,10 +107,19 @@ def run_forecasts():
 
         print(f"[FORECAST] Running forecast for {date_str}")
         subprocess.run(command)
-        print(f"[FORECAST] Finished forecast for {date_str}\n")
+        print(f"[FORECAST] Finished forecast for {date_str}")
 
-        # Queue for upload
-        pending_uploads.append(output_filename)
+        # Subset & zip from the second forecast onward
+        if forecast_count >= 1:
+            zip_name = Path(output_filename).with_suffix('.zip')
+            zip_output_path = os.path.join(LOCAL_RESULTS_PATH, zip_name)
+            subset_and_zip(output_path, zip_output_path)
+            upload_file_to_dropbox(zip_output_path, f"{DROPBOX_RESULTS_PATH}/{zip_name}")
+
+        os.remove(output_path)
+        print(f"[CLEANUP] Deleted local GRIB file: {output_filename}\n")
+
+        forecast_count += 1
         start_date += timedelta(days=1)
 
 # === Main ===
@@ -152,12 +129,6 @@ if __name__ == "__main__":
     download_folder(dbx, DROPBOX_ASSETS_PATH, LOCAL_ASSETS_PATH)
     print("[INIT] Assets downloaded.\n")
 
-    uploader_thread = threading.Thread(target=upload_worker, daemon=True)
-    uploader_thread.start()
-
     run_forecasts()
 
-    print("[DONE] Forecasts finished. Waiting for uploads to complete...")
-    uploads_done.set()
-    uploader_thread.join()
-    print("[DONE] All uploads are done.")
+    print("[DONE] All forecasts and uploads completed.")
