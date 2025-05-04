@@ -1,5 +1,4 @@
 import os
-import time
 import dropbox
 import subprocess
 import threading
@@ -19,7 +18,6 @@ dbx = dropbox.Dropbox(ACCESS_TOKEN)
 
 DROPBOX_ASSETS_PATH = "/run_panguweather/assets"
 LOCAL_ASSETS_PATH = "/workspace/assets"
-
 DROPBOX_RESULTS_PATH = "/panguweather_results"
 LOCAL_RESULTS_PATH = "/workspace/results"
 
@@ -131,12 +129,14 @@ def run_forecasts():
     time_str = "1200"
     model = "panguweather"
 
-    forecast_count = 0
-    last_grib_path = None
-    threads = []
+    forecast_queue = []
+    next_date = start_date
 
-    while start_date <= end_date:
-        date_str = start_date.strftime("%Y%m%d")
+    print("[FORECAST] Starting first two forecasts...")
+
+    # Initial two forecasts
+    for _ in range(2):
+        date_str = next_date.strftime("%Y%m%d")
         output_filename = f"panguweather_{date_str}_{time_str}_{lead_time}h_gpu.grib"
         output_path = os.path.join(LOCAL_RESULTS_PATH, output_filename)
 
@@ -155,24 +155,44 @@ def run_forecasts():
         subprocess.run(command)
         print(f"[FORECAST] Finished forecast for {date_str}")
 
-        if forecast_count >= 1 and last_grib_path is not None:
-            t = threading.Thread(target=subset_and_upload, args=(last_grib_path,))
-            t.start()
-            threads.append(t)
+        forecast_queue.append(output_path)
+        next_date += timedelta(days=1)
 
-        last_grib_path = output_path
-        forecast_count += 1
-        start_date += timedelta(days=1)
+    # Loop through remaining forecasts, controlled by previous processing
+    while next_date <= end_date:
+        # Start subsetting + upload for the first in queue
+        grib_to_process = forecast_queue.pop(0)
+        print(f"[PROCESS] Starting processing of {grib_to_process}")
+        subset_and_upload(grib_to_process)
 
-    # Process the last forecast
-    if last_grib_path:
-        t = threading.Thread(target=subset_and_upload, args=(last_grib_path,))
-        t.start()
-        threads.append(t)
+        # After processing finishes, start the next forecast
+        date_str = next_date.strftime("%Y%m%d")
+        output_filename = f"panguweather_{date_str}_{time_str}_{lead_time}h_gpu.grib"
+        output_path = os.path.join(LOCAL_RESULTS_PATH, output_filename)
 
-    # Wait for all background tasks to complete
-    for t in threads:
-        t.join()
+        command = [
+            "ai-models",
+            "--assets", LOCAL_ASSETS_PATH,
+            "--path", output_path,
+            "--input", "cds",
+            "--date", date_str,
+            "--time", time_str,
+            "--lead-time", str(lead_time),
+            model
+        ]
+
+        print(f"[FORECAST] Running forecast for {date_str}")
+        subprocess.run(command)
+        print(f"[FORECAST] Finished forecast for {date_str}")
+
+        forecast_queue.append(output_path)
+        next_date += timedelta(days=1)
+
+    # Process remaining in queue
+    while forecast_queue:
+        grib_to_process = forecast_queue.pop(0)
+        print(f"[PROCESS] Final processing of {grib_to_process}")
+        subset_and_upload(grib_to_process)
 
 if __name__ == "__main__":
     print("[INIT] Downloading assets from Dropbox...")
