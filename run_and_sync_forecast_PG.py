@@ -7,6 +7,7 @@ import xarray as xr
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from eccodes import codes_grib_new_from_file, codes_get, codes_release
 
 # === Dropbox Setup ===
 ACCESS_TOKEN = os.getenv("DROPBOX_TOKEN")
@@ -25,8 +26,6 @@ os.makedirs(LOCAL_ASSETS_PATH, exist_ok=True)
 lat_min, lat_max = 15, 50
 lon_min, lon_max = -130, -66
 
-# === Hilfsfunktionen ===
-
 def download_folder(dbx, dropbox_path, local_path):
     entries = dbx.files_list_folder(dropbox_path).entries
     for entry in entries:
@@ -42,35 +41,58 @@ def download_folder(dbx, dropbox_path, local_path):
             os.makedirs(lp, exist_ok=True)
             download_folder(dbx, dp, lp)
 
-def subset_and_zip(grib_path):
-    ds = xr.open_dataset(grib_path, engine="cfgrib")
+def subset_full_logic(grib_path, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
 
-    if ds.longitude.max() > 180:
-        ds = ds.assign_coords(longitude=(ds.longitude + 180) % 360 - 180)
-        ds = ds.sortby("longitude")
+    print(f"\n[SUBSET] Starting full subsetting of: {grib_path}")
 
-    ds_sub = ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
+    with open(grib_path, 'rb') as f:
+        seen = set()
+        while True:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            try:
+                type_of_level = codes_get(gid, 'typeOfLevel')
+                level = codes_get(gid, 'level')
+                short_name = codes_get(gid, 'shortName')
 
-    temp_dir = Path(grib_path).with_suffix('')
-    temp_dir.mkdir(parents=True, exist_ok=True)
+                key = (short_name, type_of_level, level)
+                if key in seen:
+                    continue
+                seen.add(key)
 
-    nc_files = []
-    for var in ds_sub.data_vars:
-        var_ds = ds_sub[[var]]
-        nc_path = temp_dir / f"{var}.nc"
-        var_ds.to_netcdf(nc_path)
-        nc_files.append(nc_path)
+                print(f"[SUBSET] Processing variable='{short_name}', typeOfLevel='{type_of_level}', level={level}")
+                try:
+                    ds = xr.open_dataset(
+                        grib_path,
+                        engine="cfgrib",
+                        backend_kwargs={
+                            "filter_by_keys": {
+                                "typeOfLevel": type_of_level,
+                                "level": int(level),
+                                "shortName": short_name
+                            },
+                            "indexpath": ""
+                        },
+                        decode_times=True
+                    )
 
-    zip_name = Path(grib_path).with_suffix('.zip').name
-    zip_output_path = Path(LOCAL_RESULTS_PATH) / zip_name
+                    if ds.longitude.max() > 180:
+                        ds = ds.assign_coords(longitude=(ds.longitude + 180) % 360 - 180)
+                        ds = ds.sortby("longitude")
 
-    with zipfile.ZipFile(zip_output_path, 'w') as zipf:
-        for nc_file in nc_files:
-            zipf.write(nc_file, arcname=nc_file.name)
+                    ds_sub = ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
+                    out_name = f"{short_name}_{int(level)}.nc"
+                    out_path = Path(output_dir) / out_name
+                    ds_sub.to_netcdf(out_path)
+                    print(f"[SUBSET] Saved: {out_path}")
 
-    print(f"[ZIP] Created zip archive: {zip_output_path}")
+                except Exception as e:
+                    print(f"[WARNING] Skipped variable='{short_name}', typeOfLevel='{type_of_level}', level={level}: {e}")
 
-    return zip_output_path, temp_dir
+            finally:
+                codes_release(gid)
 
 def upload_and_cleanup(zip_path, dropbox_path, grib_path, temp_dir):
     print(f"[UPLOAD] Uploading {zip_path} to {dropbox_path}")
@@ -78,7 +100,6 @@ def upload_and_cleanup(zip_path, dropbox_path, grib_path, temp_dir):
         dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
     print(f"[UPLOAD] Upload complete: {dropbox_path}")
 
-    # Clean up local files
     os.remove(zip_path)
     print(f"[CLEANUP] Deleted zip: {zip_path}")
 
@@ -90,8 +111,6 @@ def upload_and_cleanup(zip_path, dropbox_path, grib_path, temp_dir):
     if os.path.exists(grib_path):
         os.remove(grib_path)
         print(f"[CLEANUP] Deleted GRIB file: {grib_path}")
-
-# === Forecast-Loop ===
 
 def run_forecasts():
     start_date = datetime(2023, 1, 3)
@@ -124,16 +143,26 @@ def run_forecasts():
 
         if forecast_count >= 1:
             try:
-                zip_path, temp_dir = subset_and_zip(output_path)
-                dropbox_target = f"{DROPBOX_RESULTS_PATH}/{zip_path.name}"
-                upload_and_cleanup(zip_path, dropbox_target, output_path, temp_dir)
+                temp_dir = Path(output_path).with_suffix('')
+                subset_full_logic(output_path, temp_dir)
+
+                zip_name = Path(output_path).with_suffix('.zip').name
+                zip_output_path = Path(LOCAL_RESULTS_PATH) / zip_name
+
+                with zipfile.ZipFile(zip_output_path, 'w') as zipf:
+                    for nc_file in temp_dir.glob("*.nc"):
+                        zipf.write(nc_file, arcname=nc_file.name)
+
+                print(f"[ZIP] Created zip archive: {zip_output_path}")
+
+                dropbox_target = f"{DROPBOX_RESULTS_PATH}/{zip_output_path.name}"
+                upload_and_cleanup(zip_output_path, dropbox_target, output_path, temp_dir)
+
             except Exception as e:
                 print(f"[ERROR] Error during processing/uploading: {e}")
 
         forecast_count += 1
         start_date += timedelta(days=1)
-
-# === Main ===
 
 if __name__ == "__main__":
     print("[INIT] Downloading assets from Dropbox...")
