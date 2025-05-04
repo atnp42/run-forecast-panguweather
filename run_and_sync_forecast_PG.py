@@ -5,9 +5,13 @@ import subprocess
 import threading
 import xarray as xr
 import zipfile
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from eccodes import codes_grib_new_from_file, codes_get, codes_release
+
+# Suppress FutureWarnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # === Dropbox Setup ===
 ACCESS_TOKEN = os.getenv("DROPBOX_TOKEN")
@@ -41,11 +45,11 @@ def download_folder(dbx, dropbox_path, local_path):
             os.makedirs(lp, exist_ok=True)
             download_folder(dbx, dp, lp)
 
-def subset_full_logic(grib_path, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
+def subset_and_upload(grib_path):
+    temp_dir = Path(grib_path).with_suffix('')
+    os.makedirs(temp_dir, exist_ok=True)
 
     print(f"\n[SUBSET] Starting full subsetting of: {grib_path}")
-
     with open(grib_path, 'rb') as f:
         seen = set()
         while True:
@@ -84,24 +88,32 @@ def subset_full_logic(grib_path, output_dir):
 
                     ds_sub = ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
                     out_name = f"{short_name}_{int(level)}.nc"
-                    out_path = Path(output_dir) / out_name
+                    out_path = temp_dir / out_name
                     ds_sub.to_netcdf(out_path)
                     print(f"[SUBSET] Saved: {out_path}")
 
                 except Exception as e:
                     print(f"[WARNING] Skipped variable='{short_name}', typeOfLevel='{type_of_level}', level={level}: {e}")
-
             finally:
                 codes_release(gid)
 
-def upload_and_cleanup(zip_path, dropbox_path, grib_path, temp_dir):
-    print(f"[UPLOAD] Uploading {zip_path} to {dropbox_path}")
-    with open(zip_path, "rb") as f:
-        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
-    print(f"[UPLOAD] Upload complete: {dropbox_path}")
+    zip_name = Path(grib_path).with_suffix('.zip').name
+    zip_output_path = Path(LOCAL_RESULTS_PATH) / zip_name
 
-    os.remove(zip_path)
-    print(f"[CLEANUP] Deleted zip: {zip_path}")
+    with zipfile.ZipFile(zip_output_path, 'w') as zipf:
+        for nc_file in temp_dir.glob("*.nc"):
+            zipf.write(nc_file, arcname=nc_file.name)
+
+    print(f"[ZIP] Created zip archive: {zip_output_path}")
+    dropbox_target = f"{DROPBOX_RESULTS_PATH}/{zip_output_path.name}"
+
+    print(f"[UPLOAD] Uploading {zip_output_path} to {dropbox_target}")
+    with open(zip_output_path, "rb") as f:
+        dbx.files_upload(f.read(), dropbox_target, mode=dropbox.files.WriteMode("overwrite"))
+    print(f"[UPLOAD] Upload complete: {dropbox_target}")
+
+    os.remove(zip_output_path)
+    print(f"[CLEANUP] Deleted zip: {zip_output_path}")
 
     for nc_file in temp_dir.glob("*.nc"):
         nc_file.unlink()
@@ -120,6 +132,8 @@ def run_forecasts():
     model = "panguweather"
 
     forecast_count = 0
+    last_grib_path = None
+    threads = []
 
     while start_date <= end_date:
         date_str = start_date.strftime("%Y%m%d")
@@ -141,28 +155,24 @@ def run_forecasts():
         subprocess.run(command)
         print(f"[FORECAST] Finished forecast for {date_str}")
 
-        if forecast_count >= 1:
-            try:
-                temp_dir = Path(output_path).with_suffix('')
-                subset_full_logic(output_path, temp_dir)
+        if forecast_count >= 1 and last_grib_path is not None:
+            t = threading.Thread(target=subset_and_upload, args=(last_grib_path,))
+            t.start()
+            threads.append(t)
 
-                zip_name = Path(output_path).with_suffix('.zip').name
-                zip_output_path = Path(LOCAL_RESULTS_PATH) / zip_name
-
-                with zipfile.ZipFile(zip_output_path, 'w') as zipf:
-                    for nc_file in temp_dir.glob("*.nc"):
-                        zipf.write(nc_file, arcname=nc_file.name)
-
-                print(f"[ZIP] Created zip archive: {zip_output_path}")
-
-                dropbox_target = f"{DROPBOX_RESULTS_PATH}/{zip_output_path.name}"
-                upload_and_cleanup(zip_output_path, dropbox_target, output_path, temp_dir)
-
-            except Exception as e:
-                print(f"[ERROR] Error during processing/uploading: {e}")
-
+        last_grib_path = output_path
         forecast_count += 1
         start_date += timedelta(days=1)
+
+    # Process the last forecast
+    if last_grib_path:
+        t = threading.Thread(target=subset_and_upload, args=(last_grib_path,))
+        t.start()
+        threads.append(t)
+
+    # Wait for all background tasks to complete
+    for t in threads:
+        t.join()
 
 if __name__ == "__main__":
     print("[INIT] Downloading assets from Dropbox...")
