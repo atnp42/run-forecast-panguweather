@@ -123,7 +123,7 @@ def subset_and_upload(grib_path):
         print(f"[CLEANUP] Deleted GRIB file: {grib_path}")
 
 def run_forecasts():
-    start_date = datetime(2019, 12, 11)
+    start_date = datetime(2019, 12, 29)
     end_date = datetime(2019, 12, 31)
     lead_time = 168
     time_str = "1200"
